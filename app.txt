@@ -1,0 +1,530 @@
+# app.py
+import tkinter as tk
+from tkinter import ttk, messagebox
+import asyncio
+from telethon import TelegramClient
+import config
+import parser
+from trading import (
+    load_wallet,
+    check_balance,
+    swap_tokens,
+    check_token_balance,
+    sell_tokens,
+    get_current_price,
+    DEMO_WALLET,
+    PURCHASE_PRICES,
+    get_sol_price_in_usdt,
+)
+import requests
+import threading
+import time
+import json
+import os
+from datetime import datetime
+import logging
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("trading_bot.log"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+
+class TradingBotGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Crypto Trading Bot")
+        self.setup_ui()
+        self.setup_event_handlers()
+        self.initialize_data()
+
+    def setup_ui(self):
+        # Основное окно
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(pady=10, expand=True, fill="both")
+
+        # Создаем вкладки
+        self.create_main_tab()
+        self.create_settings_tab()
+        self.create_portfolio_tab()
+
+    def create_main_tab(self):
+        self.main_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.main_tab, text="Основная")
+
+        # Лог
+        self.log_text = tk.Text(self.main_tab, height=15, width=80, wrap=tk.WORD)
+        log_scroll = ttk.Scrollbar(self.main_tab, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Управление режимом
+        mode_frame = ttk.Frame(self.main_tab)
+        mode_frame.pack(pady=5, fill=tk.X)
+        self.mode_var = tk.BooleanVar(value=config.DEMO_MODE)
+        self.mode_label = ttk.Label(mode_frame, text="Режим: Демо" if config.DEMO_MODE else "Режим: Реальный")
+        self.mode_label.pack(side=tk.LEFT, padx=5)
+        self.mode_switch = ttk.Checkbutton(mode_frame, text="Демо-режим", variable=self.mode_var, command=self.toggle_mode)
+        self.mode_switch.pack(side=tk.LEFT)
+
+        # Поля ввода
+        input_frame = ttk.LabelFrame(self.main_tab, text="Параметры свопа")
+        input_frame.pack(pady=5, fill=tk.X, padx=5)
+        ttk.Label(input_frame, text="Input Mint (SOL):").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
+        self.input_mint_entry = ttk.Entry(input_frame, width=70)
+        self.input_mint_entry.insert(0, "So11111111111111111111111111111111111111112")
+        self.input_mint_entry.grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(input_frame, text="Output Mint:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
+        self.output_mint_entry = ttk.Entry(input_frame, width=70)
+        self.output_mint_entry.grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(input_frame, text="Amount (SOL):").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
+        self.amount_entry = ttk.Entry(input_frame)
+        self.amount_entry.grid(row=2, column=1, padx=5, pady=2, sticky=tk.W)
+
+        # Кнопки управления
+        button_frame = ttk.Frame(self.main_tab)
+        button_frame.pack(pady=10, fill=tk.X)
+        buttons = [
+            ("Execute Swap", self.execute_swap),
+            ("Swap from Clipboard", self.swap_from_clipboard),
+            ("Start Monitoring", self.start_monitoring),
+            ("Stop Monitoring", self.stop_monitoring),
+            ("Reset Demo", self.reset_demo_account),
+        ]
+        for i, (text, command) in enumerate(buttons):
+            ttk.Button(button_frame, text=text, command=command).grid(row=0, column=i, padx=5)
+
+    def create_settings_tab(self):
+        self.settings_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.settings_tab, text="Настройки")
+
+        # Прокрутка
+        canvas = tk.Canvas(self.settings_tab)
+        scrollbar = ttk.Scrollbar(self.settings_tab, orient="vertical", command=canvas.yview)
+        self.scrollable_frame = ttk.Frame(canvas)
+        self.scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Настройки сумм
+        amounts_frame = ttk.LabelFrame(self.scrollable_frame, text="Суммы для сигналов (SOL)")
+        amounts_frame.pack(pady=5, fill=tk.X, padx=5)
+        settings = [
+            ("Уверенный сигнал:", "confident_amount", "0.2"),
+            ("Рискованный сигнал:", "risky_amount", "0.1"),
+            ("Отложенный сигнал:", "pending_amount", "0.15"),
+        ]
+        for i, (label, attr, default) in enumerate(settings):
+            ttk.Label(amounts_frame, text=label).grid(row=i, column=0, sticky=tk.W, padx=5, pady=2)
+            entry = ttk.Entry(amounts_frame)
+            entry.insert(0, default)
+            entry.grid(row=i, column=1, padx=5, pady=2, sticky=tk.EW)
+            setattr(self, attr, entry)
+
+        # Настройки торговли
+        trade_frame = ttk.LabelFrame(self.scrollable_frame, text="Параметры торговли")
+        trade_frame.pack(pady=5, fill=tk.X, padx=5)
+        trade_settings = [
+            ("Тейк-профит (например, 2 для 200% прибыли):", "profit_target_entry", "2.0"),
+            ("Стоп-лосс (% убытка, например, 50 для 50%):", "stop_loss_entry", "50"),
+            ("Процент продажи при достижении цели (%):", "sell_percentage_entry", "100"),
+        ]
+        for i, (label, attr, default) in enumerate(trade_settings):
+            ttk.Label(trade_frame, text=label).grid(row=i, column=0, sticky=tk.W, padx=5, pady=2)
+            entry = ttk.Entry(trade_frame)
+            entry.insert(0, default)
+            entry.grid(row=i, column=1, padx=5, pady=2, sticky=tk.EW)
+            setattr(self, attr, entry)
+
+    def create_portfolio_tab(self):
+        self.portfolio_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.portfolio_tab, text="Портфель")
+
+        # Информация о SOL
+        self.sol_frame = ttk.Frame(self.portfolio_tab)
+        self.sol_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.sol_balance_label = ttk.Label(self.sol_frame, text="SOL: 0.0", font=("Helvetica", 10, "bold"))
+        self.sol_balance_label.pack(side=tk.LEFT)
+        self.last_update_label = ttk.Label(self.sol_frame, text="Последнее обновление: -")
+        self.last_update_label.pack(side=tk.RIGHT)
+
+        # Таблица портфеля
+        self.portfolio_tree = ttk.Treeview(
+            self.portfolio_tab,
+            columns=("token", "amount", "price", "value", "profit"),
+            show="headings",
+            height=15,
+        )
+
+        # Настройка колонок
+        columns = [
+            ("token", "Токен", 120, tk.W),
+            ("amount", "Количество", 100, tk.E),
+            ("price", "Цена (SOL)", 120, tk.E),
+            ("value", "Стоимость (SOL)", 120, tk.E),
+            ("profit", "Прибыль", 100, tk.E),
+        ]
+        for col_id, heading, width, anchor in columns:
+            self.portfolio_tree.heading(col_id, text=heading)
+            self.portfolio_tree.column(col_id, width=width, anchor=anchor)
+
+        # Прокрутка
+        scrollbar = ttk.Scrollbar(self.portfolio_tab, orient="vertical", command=self.portfolio_tree.yview)
+        self.portfolio_tree.configure(yscrollcommand=scrollbar.set)
+        self.portfolio_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def setup_event_handlers(self):
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def initialize_data(self):
+        self.wallet = load_wallet()
+        self.last_prices = {}
+        self.monitoring = False
+        self.profit_monitoring = False
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.portfolio_update_interval = 30
+        self.load_demo_data()
+        self.load_settings()
+        self.start_profit_monitoring()
+        self.start_portfolio_updater()
+        
+        if not config.DEMO_MODE:
+            self.log(f"Кошелёк загружен: {self.wallet.pubkey()}")
+        else:
+            self.log("Демо-режим активирован. Используется виртуальный кошелёк.")
+            
+        self.log(f"Баланс SOL: {check_balance(self.wallet)}")
+
+    def reset_demo_account(self):
+        if config.DEMO_MODE:
+            global DEMO_WALLET, PURCHASE_PRICES
+            DEMO_WALLET = {"SOL": 10.0, "tokens": {}}
+            PURCHASE_PRICES.clear()
+            from trading import API_CACHE
+            API_CACHE.clear()
+            self.log("Демо-аккаунт сброшен к начальным значениям (10 SOL)")
+            self.update_portfolio()
+        else:
+            self.log("Эта функция доступна только в демо-режиме")
+
+    def load_demo_data(self):
+        if config.DEMO_MODE and os.path.exists("demo_data.json"):
+            try:
+                with open("demo_data.json", "r") as f:
+                    data = json.load(f)
+                    global DEMO_WALLET, PURCHASE_PRICES
+                    DEMO_WALLET.update(data.get("DEMO_WALLET", {"SOL": 10.0, "tokens": {}}))
+                    PURCHASE_PRICES.update(data.get("PURCHASE_PRICES", {}))
+                self.log(f"Демо-данные загружены из файла: {DEMO_WALLET}")
+            except Exception as e:
+                self.show_error(f"Ошибка загрузки демо-данных: {str(e)}")
+
+    def save_demo_data(self):
+        if config.DEMO_MODE:
+            try:
+                data = {
+                    "DEMO_WALLET": DEMO_WALLET,
+                    "PURCHASE_PRICES": PURCHASE_PRICES,
+                    "settings": {
+                        "confident_amount": self.confident_amount.get(),
+                        "risky_amount": self.risky_amount.get(),
+                        "pending_amount": self.pending_amount.get(),
+                        "profit_target": self.profit_target_entry.get(),
+                        "stop_loss": self.stop_loss_entry.get(),
+                        "sell_percentage": self.sell_percentage_entry.get(),
+                    },
+                }
+                with open("demo_data.json", "w") as f:
+                    json.dump(data, f, indent=4)
+                self.log(f"Демо-данные сохранены в файл: {DEMO_WALLET}")
+            except Exception as e:
+                self.show_error(f"Ошибка сохранения демо-данных: {str(e)}")
+
+    def load_settings(self):
+        if config.DEMO_MODE and os.path.exists("demo_data.json"):
+            try:
+                with open("demo_data.json", "r") as f:
+                    data = json.load(f)
+                    settings = data.get("settings", {})
+                    self.confident_amount.delete(0, tk.END)
+                    self.confident_amount.insert(0, settings.get("confident_amount", "0.2"))
+                    self.risky_amount.delete(0, tk.END)
+                    self.risky_amount.insert(0, settings.get("risky_amount", "0.1"))
+                    self.pending_amount.delete(0, tk.END)
+                    self.pending_amount.insert(0, settings.get("pending_amount", "0.15"))
+                    self.profit_target_entry.delete(0, tk.END)
+                    self.profit_target_entry.insert(0, settings.get("profit_target", "2.0"))
+                    self.stop_loss_entry.delete(0, tk.END)
+                    self.stop_loss_entry.insert(0, settings.get("stop_loss", "50"))
+                    self.sell_percentage_entry.delete(0, tk.END)
+                    self.sell_percentage_entry.insert(0, settings.get("sell_percentage", "100"))
+                self.log("Настройки загружены из файла.")
+            except Exception as e:
+                self.show_error(f"Ошибка загрузки настроек: {str(e)}")
+
+    def on_closing(self):
+        self.save_demo_data()
+        self.monitoring = False
+        self.profit_monitoring = False
+        self.root.destroy()
+
+    def log(self, message: str):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.log_text.see(tk.END)
+        logger.info(message)
+
+    def show_error(self, message: str):
+        messagebox.showerror("Ошибка", message)
+        logger.error(message)
+        self.log(f"ОШИБКА: {message}")
+
+    def toggle_mode(self):
+        config.DEMO_MODE = self.mode_var.get()
+        self.mode_label.config(text="Режим: Демо" if config.DEMO_MODE else "Режим: Реальный")
+        self.log(f"Режим изменён: {'Демо' if config.DEMO_MODE else 'Реальный'}")
+        self.log(f"Баланс SOL: {check_balance(self.wallet)}")
+
+    def execute_swap(self, signal=None):
+        if signal and signal["contract_address"]:
+            input_mint = "So11111111111111111111111111111111111111112"
+            output_mint = signal["contract_address"]
+            signal_type = self.get_signal_type(signal["recommendations"])
+            amount_str = self.get_amount_by_signal_type(signal_type)
+            self.input_mint_entry.delete(0, tk.END)
+            self.input_mint_entry.insert(0, input_mint)
+            self.output_mint_entry.delete(0, tk.END)
+            self.output_mint_entry.insert(0, output_mint)
+            self.amount_entry.delete(0, tk.END)
+            self.amount_entry.insert(0, amount_str)
+        else:
+            input_mint = self.input_mint_entry.get().strip()
+            output_mint = self.output_mint_entry.get().strip()
+            amount_str = self.amount_entry.get().strip()
+            signal_type = "manual"
+
+        if not input_mint or not output_mint or not amount_str:
+            self.show_error("Ошибка: Все поля должны быть заполнены.")
+            return
+
+        try:
+            amount = float(amount_str) * 1_000_000_000
+            if amount <= 0:
+                self.show_error("Ошибка: Сумма должна быть больше 0.")
+                return
+        except ValueError:
+            self.show_error("Ошибка: Некорректное значение суммы.")
+            return
+
+        try:
+            quote = swap_tokens(self.wallet, input_mint, output_mint, int(amount))
+            if config.DEMO_MODE:
+                self.log(quote.get("demo_message", "Демо-своп выполнен"))
+                self.log(f"Демо-баланс SOL: {check_balance(self.wallet)}")
+                self.log(f"Демо-баланс {output_mint}: {check_token_balance(self.wallet, output_mint)}")
+            else:
+                self.log(f"Своп выполнен. Хэш транзакции: {quote['tx_hash']}")
+            send_notification(f"Bought {output_mint} for {amount_str} SOL")
+            self.update_portfolio()
+        except Exception as e:
+            self.show_error(f"Ошибка свопа: {str(e)}")
+
+    def swap_from_clipboard(self):
+        try:
+            clipboard_text = self.root.clipboard_get()
+            self.log(f"Получен текст из буфера: {clipboard_text}")
+            signal = parser.parse_message(clipboard_text)
+            if "покупке" in signal["recommendations"] and signal["contract_address"]:
+                self.execute_swap(signal)
+            else:
+                self.log("Ошибка: Сигнал не распознан или не для покупки.")
+        except tk.TclError:
+            self.show_error("Ошибка: Не удалось получить данные из буфера обмена.")
+
+    async def monitor_telegram(self):
+        telegram_client = TelegramClient('session', config.API_ID, config.API_HASH)
+        await telegram_client.start()
+        self.log(f"Мониторинг канала {config.TELEGRAM_CHANNEL} начат.")
+        while self.monitoring:
+            try:
+                async for message in telegram_client.iter_messages(config.TELEGRAM_CHANNEL, limit=1):
+                    if message.text:
+                        signal = parser.parse_message(message.text)
+                        signal_type = self.get_signal_type(signal["recommendations"])
+                        self.log(f"Сигнал: {signal['recommendations']}, токен: {signal['token']}, адрес: {signal['contract_address']}, уровни: {signal['price_levels']}")
+                        if "покупке" in signal["recommendations"] and signal["contract_address"]:
+                            self.execute_swap(signal)
+            except Exception as e:
+                self.show_error(f"Ошибка мониторинга Telegram: {str(e)}")
+            await asyncio.sleep(5)
+
+    def start_monitoring(self):
+        if not self.monitoring:
+            self.monitoring = True
+            self.loop.create_task(self.monitor_telegram())
+
+    def stop_monitoring(self):
+        self.monitoring = False
+        self.log("Мониторинг остановлен.")
+
+    def update_portfolio(self):
+        """Обновляет отображение портфеля с использованием Treeview"""
+        # Очищаем текущие данные
+        for item in self.portfolio_tree.get_children():
+            self.portfolio_tree.delete(item)
+
+        sol_balance = check_balance(self.wallet)
+        sol_price_usdt = get_sol_price_in_usdt()
+
+        # Обновляем информацию о SOL
+        self.sol_balance_label.config(text=f"SOL: {sol_balance:.4f} (${sol_balance * sol_price_usdt:.2f})")
+        self.last_update_label.config(text=f"Последнее обновление: {datetime.now().strftime('%H:%M:%S')}")
+
+        if config.DEMO_MODE:
+            backup_prices = self.last_prices.copy()
+            for token_mint, amount in list(DEMO_WALLET["tokens"].items()):
+                try:
+                    if amount <= 0:
+                        continue
+
+                    # Получаем данные о токене
+                    current_price_sol = get_current_price(token_mint, self.wallet)
+                    purchase_price_sol = PURCHASE_PRICES.get(token_mint, 0.0)
+
+                    # Если не удалось получить цену, используем последнюю известную
+                    if current_price_sol == 0:
+                        current_price_sol = self.last_prices.get(token_mint, 0.0)
+                        if current_price_sol == 0:
+                            continue
+
+                    # Сохраняем текущую цену для сравнения
+                    last_price = self.last_prices.get(token_mint, current_price_sol)
+                    self.last_prices[token_mint] = current_price_sol
+
+                    # Рассчитываем стоимость и прибыль
+                    value_sol = amount * current_price_sol
+                    if purchase_price_sol > 0:
+                        profit_ratio = current_price_sol / purchase_price_sol
+                    else:
+                        profit_ratio = 0.0
+
+                    # Форматируем прибыль для отображения
+                    if profit_ratio >= 1000:
+                        formatted_profit = f"{profit_ratio/1000:.1f}Kx"
+                    elif profit_ratio >= 100:
+                        formatted_profit = f"{profit_ratio:.0f}x"
+                    elif profit_ratio >= 10:
+                        formatted_profit = f"{profit_ratio:.1f}x"
+                    else:
+                        formatted_profit = f"{profit_ratio:.2f}x"
+
+                    # Добавляем токен в Treeview
+                    self.portfolio_tree.insert("", tk.END, values=(
+                        f"{token_mint[:4]}...{token_mint[-4:]}",
+                        f"{amount:.4f}",
+                        f"{current_price_sol:.8f}",
+                        f"{value_sol:.4f}",
+                        formatted_profit
+                    ))
+                except Exception as e:
+                    logger.error(f"Ошибка при обновлении токена {token_mint}: {str(e)}")
+                    # Восстанавливаем предыдущую цену в случае ошибки
+                    self.last_prices[token_mint] = backup_prices.get(token_mint, 0.0)
+                    continue
+        else:
+            self.portfolio_tree.insert("", tk.END, values=("Реальный портфель", "пока не", "реализован", "", ""))
+
+    def start_portfolio_updater(self):
+        def update_loop():
+            while True:
+                try:
+                    self.update_portfolio()
+                    time.sleep(self.portfolio_update_interval)
+                except Exception as e:
+                    logger.error(f"Ошибка в портфельном апдейтере: {str(e)}")
+                    time.sleep(10)
+
+        threading.Thread(target=update_loop, daemon=True).start()
+        self.log(f"Автоматическое обновление портфеля запущено (интервал: {self.portfolio_update_interval} сек).")
+
+    def start_profit_monitoring(self):
+        if not self.profit_monitoring:
+            self.profit_monitoring = True
+            threading.Thread(target=self.profit_monitoring_task, daemon=True).start()
+            self.log("Мониторинг прибыли запущен.")
+
+    def profit_monitoring_task(self):
+        while self.profit_monitoring:
+            try:
+                try:
+                    profit_target = float(self.profit_target_entry.get())
+                    stop_loss_percentage = float(self.stop_loss_entry.get()) / 100
+                    sell_percentage = float(self.sell_percentage_entry.get()) / 100
+                except ValueError:
+                    self.show_error("Ошибка: Некорректные значения настроек. Используются значения по умолчанию: TP 2x, SL 50%, Sell 100%.")
+                    profit_target, stop_loss_percentage, sell_percentage = 2.0, 0.5, 1.0
+
+                self.update_portfolio()
+                tokens_to_check = list(DEMO_WALLET["tokens"].keys()) if config.DEMO_MODE else []
+
+                for token_mint in tokens_to_check:
+                    try:
+                        result = sell_tokens(self.wallet, token_mint, 0, profit_target, sell_percentage)
+                        if result["status"] == "error":
+                            self.log(f"Ошибка проверки токена {token_mint}: {result['message']}")
+                    except Exception as e:
+                        self.show_error(f"Критическая ошибка при проверке токена {token_mint}: {str(e)}")
+                time.sleep(60)
+            except Exception as e:
+                logger.error(f"Ошибка в profit_monitoring_task: {str(e)}")
+                time.sleep(60)
+
+    def get_signal_type(self, recommendations):
+        """Определяет тип сигнала по тексту рекомендации"""
+        if "уверен" in recommendations.lower():
+            return "confident"
+        elif "риск" in recommendations.lower():
+            return "risky"
+        elif "отлож" in recommendations.lower():
+            return "pending"
+        return "manual"
+
+    def get_amount_by_signal_type(self, signal_type):
+        """Возвращает сумму для торговли по типу сигнала"""
+        if signal_type == "confident":
+            return self.confident_amount.get()
+        elif signal_type == "risky":
+            return self.risky_amount.get()
+        elif signal_type == "pending":
+            return self.pending_amount.get()
+        return "0.1"
+
+
+def send_notification(message):
+    url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": config.NOTIFICATION_CHAT_ID, "text": message}
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        logger.info(f"Уведомление отправлено: {message}")
+    except Exception as e:
+        logger.error(f"Ошибка отправки уведомления: {str(e)}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = TradingBotGUI(root)
+    root.mainloop()

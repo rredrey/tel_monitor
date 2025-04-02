@@ -1,0 +1,25 @@
+{
+    "DEMO_WALLET": {
+        "SOL": 9.200000000000003,
+        "tokens": {
+            "FhLjrWJMvhAAWQNQa9iyZeNwDEyv8vLdA2fh9icQpump": 278357.68963117606,
+            "B1oKaTVsg1S6TCbBwRNADXY1NF7AfpsnSrvWhWK7pump": 563539.0250774866,
+            "6wx8WqrU4ThrSNNuQPTdJcYDvfouKkUhUwd4Jjz2pump": 610128.1269066504,
+            "AvMLQpFSHZeEJoHraonmiHWdiSHVuEQr9utu2LK9KYqX": 455892.4093913837
+        }
+    },
+    "PURCHASE_PRICES": {
+        "FhLjrWJMvhAAWQNQa9iyZeNwDEyv8vLdA2fh9icQpump": 7.185e-07,
+        "B1oKaTVsg1S6TCbBwRNADXY1NF7AfpsnSrvWhWK7pump": 3.549e-07,
+        "6wx8WqrU4ThrSNNuQPTdJcYDvfouKkUhUwd4Jjz2pump": 3.278e-07,
+        "AvMLQpFSHZeEJoHraonmiHWdiSHVuEQr9utu2LK9KYqX": 4.387e-07
+    },
+    "settings": {
+        "confident_amount": "0.2",
+        "risky_amount": "0.1",
+        "pending_amount": "0.15",
+        "profit_target": "2.0",
+        "stop_loss": "50",
+        "sell_percentage": "100"
+    }
+}
