@@ -6,4 +6,5 @@ __pycache__/
 *.pyc
 *.log
 .DS_Store
-
+.fr-jUC3ZR/
+*.tar

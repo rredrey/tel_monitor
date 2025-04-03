@@ -1,26 +1,42 @@
+import json
+import math
+import time
 import requests
 from solana.rpc.api import Client
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 import base64
-import time
-from config import SOLANA_RPC_URL, PRIVATE_KEY, DEMO_MODE, PUMP_PORTAL_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from cachetools import TTLCache
 from functools import wraps
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import logging
 from datetime import datetime
-import json
-import requests
-from solana.rpc.api import Client
-from solana.keypair import Keypair
-from solana.transaction import Transaction
-from solana.system_program import TransferParams, transfer
-from spl.token.client import Token
-from spl.token.instructions import get_associated_token_address, create_associated_token_account
 import base58
 import config
+
+# Глобальные переменные
+DEMO_WALLET = {
+    "SOL": 10.0,
+    "tokens": {}
+}
+PURCHASE_PRICES = {}
+API_CACHE = TTLCache(maxsize=500, ttl=300)
+PRICE_CACHE = TTLCache(maxsize=1, ttl=300)
+LAST_SUCCESSFUL_PRICES = {}
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+client = Client(config.SOLANA_RPC_URL)
 
 def load_wallet():
     """
@@ -45,31 +61,42 @@ def load_wallet():
             logger.error(f"Ошибка загрузки кошелька: {str(e)}")
             raise Exception(f"Ошибка загрузки кошелька: {str(e)}")
 
-# Настройка кэширования
-API_CACHE = TTLCache(maxsize=500, ttl=300)  # Кэш для общих API-запросов
-PRICE_CACHE = TTLCache(maxsize=1, ttl=300)  # Специальный кэш для цены SOL
-LAST_SUCCESSFUL_PRICES = {}  # Хранит последние успешные цены
+def check_balance(wallet):
+    """
+    Проверяет баланс SOL на кошельке.
+    """
+    if config.DEMO_MODE:
+        return wallet["SOL"] if isinstance(wallet, dict) else DEMO_WALLET["SOL"]
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('trading.log'),
-        logging.StreamHandler()
-    ]
+    try:
+        balance = client.get_balance(wallet.pubkey())["result"]["value"] / 1_000_000_000
+        logger.info(f"Баланс SOL: {balance}")
+        return balance
+    except Exception as e:
+        logger.error(f"Ошибка проверки баланса: {str(e)}")
+        raise Exception(f"Ошибка проверки баланса: {str(e)}")
+
+def check_token_balance(wallet: Keypair, token_mint: str) -> float:
+    """Проверяет баланс токена в кошельке"""
+    if config.DEMO_MODE:
+        return DEMO_WALLET["tokens"].get(token_mint, 0.0)
+    
+    try:
+        pubkey = Pubkey.from_string(token_mint)
+        accounts = client.get_token_accounts_by_owner(wallet.pubkey(), {"mint": pubkey})
+        if not accounts.value:
+            return 0.0
+        amount = accounts.value[0].account.data.parsed["info"]["tokenAmount"]["uiAmount"]
+        return amount
+    except Exception as e:
+        logger.error(f"Ошибка проверки баланса токена {token_mint}: {str(e)}")
+        raise Exception(f"Ошибка проверки баланса токена: {str(e)}")
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(requests.exceptions.RequestException)
 )
-logger = logging.getLogger(__name__)
-
-client = Client(SOLANA_RPC_URL)
-
-DEMO_WALLET = {
-    "SOL": 10.0,
-    "tokens": {}
-}
-
-PURCHASE_PRICES = {}
-
 def get_sol_price():
     """Получает цену SOL с кэшированием"""
     if "sol_price" in PRICE_CACHE:
@@ -112,58 +139,6 @@ def cache_api_response(func):
             LAST_SUCCESSFUL_PRICES[args[0]] = result
         return result
     return wrapper
-
-def send_notification(message: str):
-    """Отправляет уведомление в Telegram"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Токен бота или chat ID не установлены. Уведомление пропущено.")
-        return
-    
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    
-    try:
-        response = requests.post(url, json=data, timeout=5)
-        response.raise_for_status()
-        logger.info(f"Уведомление отправлено: {message}")
-    except Exception as e:
-        logger.error(f"Не удалось отправить уведомление в Telegram: {e}")
-
-def check_balance(wallet):
-    """
-    Проверяет баланс SOL на кошельке.
-    """
-    if config.DEMO_MODE:
-        return wallet["SOL"]  # В демо-режиме возвращаем баланс из DEMO_WALLET
-
-    try:
-        client = Client(SOLANA_RPC_URL)
-        balance = client.get_balance(wallet.pubkey())["result"]["value"] / 1_000_000_000
-        logger.info(f"Баланс SOL: {balance}")
-        return balance
-    except Exception as e:
-        logger.error(f"Ошибка проверки баланса: {str(e)}")
-        raise Exception(f"Ошибка проверки баланса: {str(e)}")
-
-def check_token_balance(wallet: Keypair, token_mint: str) -> float:
-    """Проверяет баланс токена в кошельке"""
-    if DEMO_MODE:
-        return DEMO_WALLET["tokens"].get(token_mint, 0.0)
-    
-    try:
-        pubkey = Pubkey.from_string(token_mint)
-        accounts = client.get_token_accounts_by_owner(wallet.pubkey(), {"mint": pubkey})
-        if not accounts.value:
-            return 0.0
-        amount = accounts.value[0].account.data.parsed["info"]["tokenAmount"]["uiAmount"]
-        return amount
-    except Exception as e:
-        logger.error(f"Ошибка проверки баланса токена {token_mint}: {str(e)}")
-        raise Exception(f"Ошибка проверки баланса токена: {str(e)}")
 
 @cache_api_response
 @retry(
@@ -253,7 +228,7 @@ def get_current_price(token_mint: str, wallet: Keypair = None) -> float:
             return price
     
     # И наконец GMGN.ai для реального режима
-    if not DEMO_MODE and wallet:
+    if not config.DEMO_MODE and wallet:
         try:
             logger.info(f"Попытка получить цену через GMGN.ai для токена {token_mint[:6]}...{token_mint[-6:]}")
             GMGN_API_HOST = "https://gmgn.ai"
@@ -373,7 +348,7 @@ def demo_sell_token(token_mint: str, profit_target: float, sell_percentage: floa
 )
 def swap_on_pump_fun(wallet: Keypair, input_mint: str, output_mint: str, amount: int, action: str = "BUY") -> dict:
     """Выполняет своп через Pump.fun API"""
-    url = f"https://pumpportal.fun/api/trade?api-key={PUMP_PORTAL_API_KEY}"
+    url = f"https://pumpportal.fun/api/trade?api-key={config.PUMP_PORTAL_API_KEY}"
     slippage = 0.5
     priority_fee = 0.00005
     denominated_in_sol = "true" if action == "BUY" else "false"
@@ -402,7 +377,7 @@ def swap_on_pump_fun(wallet: Keypair, input_mint: str, output_mint: str, amount:
         input_amount_sol = float(result.get("amountIn", result.get("inputAmount", 0))) / 1_000_000_000
         output_amount = float(result.get("amountOut", result.get("outputAmount", 0))) / 1_000_000_000
 
-        if DEMO_MODE:
+        if config.DEMO_MODE:
             if action == "BUY":
                 if DEMO_WALLET["SOL"] >= input_amount_sol:
                     DEMO_WALLET["SOL"] -= input_amount_sol
@@ -477,7 +452,7 @@ def swap_on_gmgn(wallet: Keypair, input_mint: str, output_mint: str, amount: int
             input_amount_sol = int(quote["inAmount"]) / 1_000_000_000
             output_amount = int(quote["outAmount"]) / 1_000_000_000
 
-            if DEMO_MODE:
+            if config.DEMO_MODE:
                 if input_mint == "So11111111111111111111111111111111111111112":
                     if DEMO_WALLET["SOL"] >= input_amount_sol:
                         DEMO_WALLET["SOL"] -= input_amount_sol
@@ -597,7 +572,7 @@ def swap_tokens(wallet: Keypair, input_mint: str, output_mint: str, amount: int,
 
 def sell_tokens(wallet: Keypair, token_mint: str, amount: int, profit_target: float, sell_percentage: float = 1.0, max_retries=3, retry_delay=5) -> dict:
     """Функция для продажи токенов"""
-    if DEMO_MODE:
+    if config.DEMO_MODE:
         return demo_sell_token(token_mint, profit_target, sell_percentage)
 
     current_price = get_current_price(token_mint, wallet)
@@ -647,6 +622,48 @@ def sell_tokens(wallet: Keypair, token_mint: str, amount: int, profit_target: fl
             "status": "error",
             "message": f"Не удалось выполнить продажу: {str(e)}"
         }
+
+def send_notification(message: str):
+    """Отправляет уведомление в Telegram"""
+    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
+        logger.warning("Токен бота или chat ID не установлены. Уведомление пропущено.")
+        return
+    
+    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": config.TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    
+    try:
+        response = requests.post(url, json=data, timeout=5)
+        response.raise_for_status()
+        logger.info(f"Уведомление отправлено: {message}")
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление в Telegram: {e}")
+
+def format_price(price):
+    """Форматирует цену для отображения."""
+    if price == 0:
+        return "N/A"
+    elif price < 0.001:
+        exponent = int(abs(math.log10(price)))
+        mantissa = price * (10**exponent)
+        return f"{mantissa:.2f}e-{exponent}"
+    else:
+        return f"${price:.4f}"
+
+def format_profit(profit_ratio):
+    """Форматирует прибыль для отображения."""
+    if profit_ratio >= 1000:
+        return f"{profit_ratio / 1000:.1f}Kx"
+    elif profit_ratio >= 100:
+        return f"{profit_ratio:.0f}x"
+    elif profit_ratio >= 10:
+        return f"{profit_ratio:.1f}x"
+    else:
+        return f"{profit_ratio:.2f}x"
 
 if __name__ == "__main__":
     wallet = load_wallet()

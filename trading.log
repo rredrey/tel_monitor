@@ -628,3 +628,5 @@
 2025-04-01 21:19:31,930 - trading.trading - INFO - Запрашиваем цену SOL через CoinGecko...
 2025-04-01 21:19:32,183 - trading.trading - INFO - Получена новая цена SOL: 126.29 USDT
 2025-04-01 21:19:32,185 - trading.trading - INFO - Получение текущей цены для токена ChKWH4...89pump
+2025-04-02 15:09:53,637 - __main__ - ERROR - Error loading settings: 'TradingBotGUI' object has no attribute 'confident_amount'
+2025-04-02 15:18:15,583 - __main__ - ERROR - Error loading settings: 'TradingBotGUI' object has no attribute 'log_text'
